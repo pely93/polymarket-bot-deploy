@@ -441,8 +441,8 @@ class SmartMoneyTracker:
 
         for addr, sw in candidates.items():
             closed = api_get(f"{BASE_DATA_API}/closed-positions", {
-                "user": addr, "limit": 100,
-                "sortBy": "CURRENT", "sortDirection": "DESC",
+                "user": addr, "limit": 50,
+                "sortBy": "REALIZEDPNL", "sortDirection": "DESC",
             })
             time.sleep(0.3)
 
@@ -451,14 +451,17 @@ class SmartMoneyTracker:
 
             wins, total, total_pnl, total_initial = 0, 0, 0.0, 0.0
             for pos in closed:
-                cash_pnl = float(pos.get("cashPnl", 0) or 0)
-                initial = float(pos.get("initialValue", 0) or 0)
+                # closed-positions returns: realizedPnl, totalBought, avgPrice
+                realized_pnl = float(pos.get("realizedPnl", 0) or 0)
+                total_bought = float(pos.get("totalBought", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                initial = total_bought * avg_price  # reconstruct initial value
                 if abs(initial) < 1:
                     continue
                 total += 1
-                total_pnl += cash_pnl
+                total_pnl += realized_pnl
                 total_initial += abs(initial)
-                if cash_pnl > 0:
+                if realized_pnl > 0:
                     wins += 1
 
             if total < self.cfg["min_closed_positions"]:
