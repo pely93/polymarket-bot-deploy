@@ -506,11 +506,13 @@ class SmartMoneyTracker:
         now = int(datetime.now(timezone.utc).timestamp())
         lookback = now - self.cfg["activity_lookback_seconds"]
         signals = []
+        seen_tx = set()  # Deduplicate by transaction hash
 
         for addr, sw in self.tracked_wallets.items():
+            # Fetch both BUY and SELL — subscribers need to know exits too
             trades = api_get(f"{BASE_DATA_API}/activity", {
-                "user": addr, "type": "TRADE", "side": "BUY",
-                "start": lookback, "limit": 30,
+                "user": addr, "type": "TRADE",
+                "start": lookback, "limit": 50,
                 "sortBy": "TIMESTAMP", "sortDirection": "DESC",
             })
             time.sleep(0.3)
@@ -523,21 +525,33 @@ class SmartMoneyTracker:
                 if ts <= sw.last_seen_trade_ts:
                     continue
 
+                tx_hash = trade.get("transactionHash", "")
+                if tx_hash in seen_tx:
+                    continue
+                seen_tx.add(tx_hash)
+
+                side = trade.get("side", "BUY")
                 size = float(trade.get("size", 0) or 0)
                 price = float(trade.get("price", 0) or 0)
+                # Use usdcSize directly from API — this is the actual USD amount
+                usdc_size = float(trade.get("usdcSize", 0) or 0)
+                if usdc_size <= 0:
+                    usdc_size = size * price  # Fallback calculation
+
                 if price <= 0:
                     continue
-                est_usd = size * price
+
                 condition_id = trade.get("conditionId", "")
                 outcome = trade.get("outcome", "Unknown")
                 title = trade.get("title", "")
                 slug = trade.get("slug", "")
+                event_slug = trade.get("eventSlug", slug)
 
-                # 4A: Min trade size
-                if est_usd < self.cfg["min_trade_size_usd"]:
+                # 4A: Min trade size (USD)
+                if usdc_size < self.cfg["min_trade_size_usd"]:
                     continue
 
-                # Fetch market details
+                # Fetch market details for liquidity check and current probability
                 if condition_id:
                     market = get_market_details(condition_id)
                     time.sleep(0.15)
@@ -551,36 +565,38 @@ class SmartMoneyTracker:
                 if market.get("closed") or not market.get("active", False):
                     continue
 
-                # 4B: Liquidity
-                liq = market.get("liquidity", 0)
+                # 4B: Liquidity check
+                liq = float(market.get("liquidity", 0) or 0)
                 if liq < self.cfg["min_market_liquidity"]:
                     continue
 
-                # 4C: Probability window
+                # 4C: Get CURRENT probability (not the price they bought at)
                 try:
                     prices = json.loads(market.get("outcome_prices", "[]"))
                     idx = int(trade.get("outcomeIndex", 0))
-                    prob = float(prices[idx]) if prices else price
+                    current_prob = float(prices[idx]) if prices else price
                 except (json.JSONDecodeError, IndexError, ValueError):
-                    prob = price
+                    current_prob = price
 
-                if prob > self.cfg["max_probability"]:
-                    continue
-                if prob < self.cfg["min_probability"] and est_usd < self.cfg["longshot_min_trade_usd"]:
-                    continue
+                # For BUY signals: skip if market is already too decided
+                if side == "BUY":
+                    if current_prob > self.cfg["max_probability"]:
+                        continue
+                    if current_prob < self.cfg["min_probability"] and usdc_size < self.cfg["longshot_min_trade_usd"]:
+                        continue
 
                 signals.append(Signal(
                     wallet_address=addr,
                     wallet_username=sw.username,
                     wallet_tier=sw.tier,
                     market_question=market.get("question", title),
-                    market_slug=market.get("slug", slug),
+                    market_slug=event_slug or market.get("slug", slug),
                     outcome=outcome,
-                    side="BUY",
+                    side=side,
                     size_tokens=size,
                     price=price,
-                    estimated_usd=est_usd,
-                    market_probability=prob,
+                    estimated_usd=usdc_size,
+                    market_probability=current_prob,
                     market_liquidity=liq,
                     timestamp=ts,
                 ))
@@ -618,34 +634,84 @@ class SmartMoneyTracker:
         tier_labels = {"A": "🥇 ELITE", "B": "🥈 STRONG", "C": "🥉 WATCH"}
         tier = tier_labels.get(sig.wallet_tier, "📊")
 
+        # ── Confidence level ──
         if sig.convergence_count >= 3:
             confidence = "🔥🔥🔥 ULTRA HIGH CONVICTION"
         elif sig.convergence_count >= 2:
-            confidence = "🔥🔥 HIGH CONVICTION"
+            confidence = "🔥🔥 HIGH CONVICTION (Multi-Wallet)"
         elif sig.wallet_tier == "A":
-            confidence = "🔥 STRONG SIGNAL"
+            confidence = "🔥 HIGH CONVICTION"
+        elif sig.wallet_tier == "B":
+            confidence = "⚡ MEDIUM CONVICTION"
         else:
-            confidence = "📊 SMART MONEY SIGNAL"
+            confidence = "📊 NEW SIGNAL"
 
         prob_pct = sig.market_probability * 100
 
-        msg = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"  {confidence}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"❓ <b>{sig.market_question}</b>\n\n"
-            f"👉 TIP: <b>{sig.outcome.upper()}</b> @ {prob_pct:.1f}%\n\n"
-            f"💰 Trade: <b>${sig.estimated_usd:,.0f}</b> "
-            f"({sig.size_tokens:,.0f} shares @ ${sig.price:.2f})\n"
-            f"💧 Liquidity: ${sig.market_liquidity:,.0f}\n\n"
-            f"👤 Trader: <code>{sig.wallet_username}</code> [{tier}]\n"
-        )
-        if sig.convergence_count >= 2:
-            msg += f"\n🎯 <b>{sig.convergence_count} smart wallets</b> buying this!\n"
+        # ── BUY signal: the main product ──
+        if sig.side == "BUY":
+            # Calculate potential ROI if this bet wins
+            if sig.market_probability > 0:
+                roi = ((1 / sig.market_probability) - 1) * 100
+            else:
+                roi = 0
 
+            # Example gains at different investment amounts
+            gains_100 = (100 / sig.market_probability) - 100 if sig.market_probability > 0 else 0
+            gains_500 = (500 / sig.market_probability) - 500 if sig.market_probability > 0 else 0
+            gains_1000 = (1000 / sig.market_probability) - 1000 if sig.market_probability > 0 else 0
+
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  🚨 NEW BET TIP — {confidence}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"❓ <b>{sig.market_question}</b>\n\n"
+                f"👉 BET: <b>{sig.outcome.upper()}</b>\n"
+                f"💵 Current price: <b>${sig.market_probability:.2f}</b> ({prob_pct:.0f}%)\n"
+                f"📈 Potential ROI if YES: <b>+{roi:.0f}%</b>\n\n"
+            )
+
+            # Show what subscribers could make
+            msg += "💰 <b>If this bet wins:</b>\n"
+            msg += f"  • $100 bet → <b>+${gains_100:,.0f} profit</b>\n"
+            msg += f"  • $500 bet → <b>+${gains_500:,.0f} profit</b>\n"
+            msg += f"  • $1,000 bet → <b>+${gains_1000:,.0f} profit</b>\n\n"
+
+            # Why we trust this signal
+            msg += (
+                f"🐋 <b>Smart Money behind this:</b>\n"
+                f"  Trader: <code>{sig.wallet_username}</code> [{tier}]\n"
+                f"  Their bet: <b>${sig.estimated_usd:,.0f}</b> "
+                f"({sig.size_tokens:,.0f} shares)\n"
+                f"  💧 Market liquidity: ${sig.market_liquidity:,.0f}\n"
+            )
+
+        # ── SELL signal: exit warning ──
+        else:
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  ⚠️ EXIT ALERT\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"❓ <b>{sig.market_question}</b>\n\n"
+                f"🔴 Smart money is <b>SELLING {sig.outcome.upper()}</b>\n"
+                f"💵 Sold at: ${sig.price:.2f} | Amount: ${sig.estimated_usd:,.0f}\n\n"
+                f"👤 <code>{sig.wallet_username}</code> [{tier}]\n\n"
+                f"⚡ <i>If you hold this position, consider taking profits.</i>\n"
+            )
+
+        # ── Convergence highlight ──
+        if sig.convergence_count >= 2:
+            msg += (
+                f"\n🎯 <b>{sig.convergence_count} verified smart wallets</b> "
+                f"are making this same bet!\n"
+            )
+
+        # ── Link and timestamp ──
         msg += (
-            f"\n🔗 <a href='https://polymarket.com/event/{sig.market_slug}'>View Market</a>\n"
-            f"⏰ {datetime.fromtimestamp(sig.timestamp, tz=timezone.utc).strftime('%H:%M UTC')}"
+            f"\n🔗 <a href='https://polymarket.com/event/{sig.market_slug}'>"
+            f"Open on Polymarket</a>\n"
+            f"⏰ {datetime.fromtimestamp(sig.timestamp, tz=timezone.utc).strftime('%H:%M UTC')} "
+            f"| ⚠️ <i>Not financial advice. DYOR.</i>"
         )
         return msg
 
@@ -787,10 +853,13 @@ def bot_main_loop():
                         new_signals = tracker.check_convergence(new_signals)
                         for sig in new_signals:
                             msg = tracker.format_signal(sig)
-                            send_telegram(msg)
+                            ok = send_telegram(msg)
+                            action = "BET TIP" if sig.side == "BUY" else "EXIT ALERT"
                             logger.info(
-                                f"[SmartMoney] ALERT: {sig.market_question[:40]}... "
-                                f"by {sig.wallet_username} (${sig.estimated_usd:,.0f})"
+                                f"[SmartMoney] 📤 {action} SENT: {sig.side} {sig.outcome} on "
+                                f"'{sig.market_question[:50]}...' "
+                                f"by {sig.wallet_username} (${sig.estimated_usd:,.0f}) "
+                                f"[convergence={sig.convergence_count}]"
                             )
                 except Exception as e:
                     logger.error(f"[SmartMoney] Trade poll error: {e}")
