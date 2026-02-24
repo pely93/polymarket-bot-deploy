@@ -440,17 +440,28 @@ class SmartMoneyTracker:
         validated = {}
 
         for addr, sw in candidates.items():
-            closed = api_get(f"{BASE_DATA_API}/closed-positions", {
-                "user": addr, "limit": 50,
-                "sortBy": "REALIZEDPNL", "sortDirection": "DESC",
-            })
-            time.sleep(0.3)
+            # CRITICAL: Sort by TIMESTAMP not REALIZEDPNL to get an unbiased
+            # sample of wins AND losses. Sorting by PnL DESC only shows winners,
+            # which inflates win rate to 100% for everyone.
+            # Fetch two pages (100 positions total) for a better sample.
+            all_closed = []
+            for offset in [0, 50]:
+                page = api_get(f"{BASE_DATA_API}/closed-positions", {
+                    "user": addr, "limit": 50,
+                    "sortBy": "TIMESTAMP", "sortDirection": "DESC",
+                    "offset": offset,
+                })
+                time.sleep(0.3)
+                if page:
+                    all_closed.extend(page)
+                else:
+                    break  # No more pages or API error
 
-            if not closed or len(closed) < self.cfg["min_closed_positions"]:
+            if not all_closed or len(all_closed) < self.cfg["min_closed_positions"]:
                 continue
 
-            wins, total, total_pnl, total_initial = 0, 0, 0.0, 0.0
-            for pos in closed:
+            wins, losses, total, total_pnl, total_initial = 0, 0, 0, 0.0, 0.0
+            for pos in all_closed:
                 # closed-positions returns: realizedPnl, totalBought, avgPrice
                 realized_pnl = float(pos.get("realizedPnl", 0) or 0)
                 total_bought = float(pos.get("totalBought", 0) or 0)
@@ -463,6 +474,8 @@ class SmartMoneyTracker:
                 total_initial += abs(initial)
                 if realized_pnl > 0:
                     wins += 1
+                else:
+                    losses += 1
 
             if total < self.cfg["min_closed_positions"]:
                 continue
@@ -482,7 +495,7 @@ class SmartMoneyTracker:
                 else:
                     sw.tier = "C"
                 validated[addr] = sw
-                logger.info(f"  ✓ {sw.username}: WR={wr:.0%} ROI={roi:.1f}% Tier={sw.tier}")
+                logger.info(f"  ✓ {sw.username}: WR={wr:.0%} ({wins}W/{losses}L) ROI={roi:.1f}% Tier={sw.tier}")
 
         logger.info(f"[SmartMoney] Layer 3 pass: {len(validated)} wallets")
         return validated
@@ -653,7 +666,8 @@ class SmartMoneyTracker:
                 for sw in sorted(wallets, key=lambda x: -x.pnl_all)[:5]:
                     msg += (
                         f"  • <code>{sw.username}</code> — "
-                        f"WR: {sw.win_rate:.0%} | ROI: {sw.roi_percent:.0f}% | "
+                        f"WR: {sw.win_rate:.0%} ({sw.closed_positions_count} bets) | "
+                        f"ROI: {sw.roi_percent:.0f}% | "
                         f"PnL: ${sw.pnl_all:,.0f}\n"
                     )
                 msg += "\n"
