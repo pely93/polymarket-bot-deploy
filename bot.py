@@ -75,7 +75,7 @@ SMART_MONEY = {
     "enabled": True,
     "leaderboard_refresh_hours": 6,
     "trade_poll_seconds": 60,
-    "activity_lookback_seconds": 300,
+    "activity_lookback_seconds": 900,  # 15 minutes — wide enough to never miss trades
 
     # Layer 1: Leaderboard pre-filter
     "min_pnl_all_time": 5_000,
@@ -507,6 +507,9 @@ class SmartMoneyTracker:
         lookback = now - self.cfg["activity_lookback_seconds"]
         signals = []
         seen_tx = set()  # Deduplicate by transaction hash
+        total_trades_found = 0
+        total_filtered_out = 0
+        filter_reasons = {}
 
         for addr, sw in self.tracked_wallets.items():
             # Fetch both BUY and SELL — subscribers need to know exits too
@@ -525,6 +528,8 @@ class SmartMoneyTracker:
                 if ts <= sw.last_seen_trade_ts:
                     continue
 
+                total_trades_found += 1
+
                 tx_hash = trade.get("transactionHash", "")
                 if tx_hash in seen_tx:
                     continue
@@ -539,6 +544,8 @@ class SmartMoneyTracker:
                     usdc_size = size * price  # Fallback calculation
 
                 if price <= 0:
+                    filter_reasons["zero_price"] = filter_reasons.get("zero_price", 0) + 1
+                    total_filtered_out += 1
                     continue
 
                 condition_id = trade.get("conditionId", "")
@@ -549,6 +556,8 @@ class SmartMoneyTracker:
 
                 # 4A: Min trade size (USD)
                 if usdc_size < self.cfg["min_trade_size_usd"]:
+                    filter_reasons["too_small"] = filter_reasons.get("too_small", 0) + 1
+                    total_filtered_out += 1
                     continue
 
                 # Fetch market details for liquidity check and current probability
@@ -563,11 +572,15 @@ class SmartMoneyTracker:
                     }
 
                 if market.get("closed") or not market.get("active", False):
+                    filter_reasons["closed_inactive"] = filter_reasons.get("closed_inactive", 0) + 1
+                    total_filtered_out += 1
                     continue
 
                 # 4B: Liquidity check
                 liq = float(market.get("liquidity", 0) or 0)
                 if liq < self.cfg["min_market_liquidity"]:
+                    filter_reasons["low_liquidity"] = filter_reasons.get("low_liquidity", 0) + 1
+                    total_filtered_out += 1
                     continue
 
                 # 4C: Get CURRENT probability (not the price they bought at)
@@ -581,8 +594,12 @@ class SmartMoneyTracker:
                 # For BUY signals: skip if market is already too decided
                 if side == "BUY":
                     if current_prob > self.cfg["max_probability"]:
+                        filter_reasons["prob_too_high"] = filter_reasons.get("prob_too_high", 0) + 1
+                        total_filtered_out += 1
                         continue
                     if current_prob < self.cfg["min_probability"] and usdc_size < self.cfg["longshot_min_trade_usd"]:
+                        filter_reasons["longshot_small"] = filter_reasons.get("longshot_small", 0) + 1
+                        total_filtered_out += 1
                         continue
 
                 signals.append(Signal(
@@ -605,6 +622,14 @@ class SmartMoneyTracker:
             if trades:
                 max_ts = max(int(t.get("timestamp", 0) or 0) for t in trades)
                 sw.last_seen_trade_ts = max(sw.last_seen_trade_ts, max_ts)
+
+        # Diagnostic logging — helps debug why signals aren't firing
+        if total_trades_found > 0 or len(signals) > 0:
+            logger.info(
+                f"[SmartMoney] Poll result: {total_trades_found} new trades found, "
+                f"{total_filtered_out} filtered out, {len(signals)} signals generated. "
+                f"Filter reasons: {filter_reasons}"
+            )
 
         return signals
 
@@ -815,6 +840,7 @@ def bot_main_loop():
 
     last_scanner_run = 0
     last_tracker_refresh = 0
+    poll_count = 0
 
     # Initialize smart money tracker — do the first leaderboard scan
     if tracker:
@@ -828,6 +854,7 @@ def bot_main_loop():
     while True:
         try:
             now = time.time()
+            poll_count += 1
 
             # ── Engine 1: Market Scanner ──
             if scanner and (now - last_scanner_run) >= MARKET_SCANNER["scan_interval_hours"] * 3600:
@@ -865,6 +892,15 @@ def bot_main_loop():
                     logger.error(f"[SmartMoney] Trade poll error: {e}")
 
             # Sleep between polls
+            # Heartbeat log every ~15 min so you know the bot is alive
+            if poll_count % 15 == 0:
+                wallets_n = len(tracker.tracked_wallets) if tracker else 0
+                logger.info(
+                    f"[Heartbeat] Poll #{poll_count} | "
+                    f"Tracking {wallets_n} wallets | "
+                    f"Bot uptime: {(now - last_tracker_refresh) / 60:.0f}min since last refresh"
+                )
+
             time.sleep(SMART_MONEY["trade_poll_seconds"] if tracker else 60)
 
         except Exception as e:
