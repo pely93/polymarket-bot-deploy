@@ -538,10 +538,11 @@ class SmartMoneyTracker:
                 side = trade.get("side", "BUY")
                 size = float(trade.get("size", 0) or 0)
                 price = float(trade.get("price", 0) or 0)
-                # Use usdcSize directly from API — this is the actual USD amount
+                # The API returns usdcSize as the dollar value of the trade
                 usdc_size = float(trade.get("usdcSize", 0) or 0)
+                # Fallback: size is in shares, price is $/share, so size*price = USD
                 if usdc_size <= 0:
-                    usdc_size = size * price  # Fallback calculation
+                    usdc_size = size * price
 
                 if price <= 0:
                     filter_reasons["zero_price"] = filter_reasons.get("zero_price", 0) + 1
@@ -555,12 +556,20 @@ class SmartMoneyTracker:
                 event_slug = trade.get("eventSlug", slug)
 
                 # 4A: Min trade size (USD)
+                # Log first few filtered trades to understand the data
                 if usdc_size < self.cfg["min_trade_size_usd"]:
+                    if filter_reasons.get("too_small", 0) < 3:
+                        logger.info(
+                            f"  [debug] Filtered too_small: {sw.username} | "
+                            f"usdcSize={trade.get('usdcSize')} size={size} price={price} "
+                            f"calc_usd={usdc_size:.2f} | {title[:40]}"
+                        )
                     filter_reasons["too_small"] = filter_reasons.get("too_small", 0) + 1
                     total_filtered_out += 1
                     continue
 
-                # Fetch market details for liquidity check and current probability
+                # Fetch market details for liquidity and current probability
+                # But do NOT use Gamma's active/closed flags to reject — they lag behind
                 if condition_id:
                     market = get_market_details(condition_id)
                     time.sleep(0.15)
@@ -571,7 +580,16 @@ class SmartMoneyTracker:
                         "outcome_prices": "[]",
                     }
 
-                if market.get("closed") or not market.get("active", False):
+                # Only skip markets that are TRULY closed/resolved
+                # The Gamma API's "active" flag lags — a market someone just traded
+                # on is clearly still active, so we trust the trade over the metadata
+                market_closed = market.get("closed", False)
+                if market_closed:
+                    if filter_reasons.get("closed_inactive", 0) < 3:
+                        logger.info(
+                            f"  [debug] Filtered closed: {title[:40]} | "
+                            f"closed={market.get('closed')} active={market.get('active')}"
+                        )
                     filter_reasons["closed_inactive"] = filter_reasons.get("closed_inactive", 0) + 1
                     total_filtered_out += 1
                     continue
