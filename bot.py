@@ -442,7 +442,7 @@ class SmartMoneyTracker:
         for addr, sw in candidates.items():
             closed = api_get(f"{BASE_DATA_API}/closed-positions", {
                 "user": addr, "limit": 100,
-                "sortBy": "CURRENT", "sortDirection": "DESC",
+                "sortBy": "REALIZEDPNL", "sortDirection": "DESC",
             })
             time.sleep(0.3)
 
