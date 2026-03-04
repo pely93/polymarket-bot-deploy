@@ -193,7 +193,7 @@ app = Flask(__name__)
 @app.route("/")
 def health(): return "OK", 200
 
-def bot_loop():
+def bot_main_loop():
     scanner = MarketScanner()
     tracker = SmartMoneyTracker()
     last_scan = 0
@@ -211,6 +211,6 @@ def bot_loop():
         time.sleep(SMART_MONEY["trade_poll_seconds"])
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=bot_main_loop, daemon=True).start() # <--- Update this too
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
