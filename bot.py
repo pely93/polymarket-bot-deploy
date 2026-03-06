@@ -1,25 +1,10 @@
-"""
-==============================================================================
-  POLYMARKET SMART MONEY TIPSTER — FINAL PRODUCTION VERSION
-  ─────────────────────────────────────────────────────────
-  FIXES: 
-  - Layer 3 API: Changed 'CURRENT' to 'REALIZEDPNL' to fix 400 Errors.
-  - UI: All Telegram alerts converted to English.
-  - Render: Optimized port binding and heartbeat for Free Plan.
-==============================================================================
-"""
-
 import os
 import sys
-import json
 import time
 import logging
 import threading
 import requests
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -29,188 +14,130 @@ load_dotenv()
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-USER_BANKROLL = float(os.getenv("USER_BANKROLL", "1000"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Set this to how often you want the daily tip (e.g., 24 for once a day)
+POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
-BASE_DATA_API = "https://data-api.polymarket.com"
-BASE_GAMMA_API = "https://gamma-api.polymarket.com"
+# APIs
+GAMMA_API = "https://gamma-api.polymarket.com/markets"
 
-MARKET_SCANNER = {
-    "enabled": True,
-    "min_probability": 65,
-    "max_probability": 92,
-    "min_volume": 10000,
-    "min_liquidity": 5000,
-    "markets_per_post": 5,
-    "scan_interval_hours": 6,
-}
-
-SMART_MONEY = {
-    "enabled": True,
-    "leaderboard_refresh_hours": 6,
-    "trade_poll_seconds": 60,
-    "activity_lookback_seconds": 3600, # 1 hour for Render Free resilience
-    "min_pnl_all_time": 5000,
-    "min_win_rate": 0.54,
-    "min_closed_positions": 8,
-    "min_trade_size_usd": 20, 
-    "min_market_liquidity": 5000,
-    "max_probability": 0.92,
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
+# SIGNAL ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class SmartWallet:
-    address: str
-    username: str
-    pnl_all: float = 0.0
-    win_rate: float = 0.0
-    tier: str = "B"
-    last_seen_trade_ts: int = 0
+class DailyTipEngine:
+    def fetch_all_active_markets(self):
+        """Fetches a wide range of active markets."""
+        try:
+            params = {"limit": 100, "active": "true", "closed": "false", "unrequested": "false"}
+            resp = requests.get(GAMMA_API, params=params, timeout=20)
+            return resp.json() if resp.status_code == 200 else []
+        except Exception as e:
+            logger.error(f"Fetch error: {e}")
+            return []
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def send_telegram(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, json=payload, timeout=15)
-    except Exception as e:
-        logger.error(f"Telegram failed: {e}")
-
-def api_get(url, params=None):
-    try:
-        resp = requests.get(url, params=params, timeout=20)
-        if resp.status_code == 200: return resp.json()
-    except: return None
-    return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENGINES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class MarketScanner:
-    def run_cycle(self):
-        logger.info("[Scanner] Fetching markets...")
-        raw = api_get(f"{BASE_GAMMA_API}/markets", {"limit": 100, "active": "true", "closed": "false"})
-        if not raw: return
-        
-        best = []
-        for m in raw:
+    def select_best_tip(self, markets):
+        """Scores markets to find the absolute best one to share."""
+        scored_markets = []
+        for m in markets:
             try:
-                vol = float(m.get("volume") or 0)
-                liq = float(m.get("liquidity") or 0)
-                if vol < MARKET_SCANNER["min_volume"] or liq < MARKET_SCANNER["min_liquidity"]: continue
-                
+                # Basic requirements: Must have price and volume
                 tokens = m.get("tokens", [])
-                bt = max(tokens, key=lambda t: float(t.get("price") or 0))
-                price = float(bt.get("price"))
-                prob = price * 100
+                if len(tokens) < 2: continue
                 
-                if MARKET_SCANNER["min_probability"] <= prob <= MARKET_SCANNER["max_probability"]:
-                    best.append({
-                        "q": m["question"], "out": bt["outcome"], "prob": prob, 
-                        "roi": ((1/price)-1)*100, "slug": m["slug"]
-                    })
+                vol = float(m.get("volume", 0) or 0)
+                liq = float(m.get("liquidity", 0) or 0)
+                
+                # Pick the outcome with the best value (Price between 0.20 and 0.85)
+                # We avoid 0.99 (no profit) and 0.01 (too unlikely)
+                for t in tokens:
+                    price = float(t.get("price", 0) or 0)
+                    if 0.15 < price < 0.85:
+                        roi = ((1 / price) - 1) * 100
+                        # Score = Volume weighted by ROI
+                        score = (vol * 0.4) + (liq * 0.6) + (roi * 10)
+                        
+                        scored_markets.append({
+                            "question": m.get("question"),
+                            "outcome": t.get("outcome"),
+                            "price": price,
+                            "prob": price * 100,
+                            "roi": roi,
+                            "vol": vol,
+                            "liq": liq,
+                            "slug": m.get("slug"),
+                            "score": score
+                        })
             except: continue
+        
+        if not scored_markets: return None
+        # Return the market with the highest score
+        return max(scored_markets, key=lambda x: x["score"])
 
-        if best:
-            msg = "📊 <b>DAILY MARKET SCAN</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            for m in best[:5]:
-                msg += f"🔹 <b>{m['q']}</b>\nSide: {m['out']} ({m['prob']:.1f}%)\nROI: +{m['roi']:.1f}%\n<a href='https://polymarket.com/event/{m['slug']}'>Trade Link</a>\n\n"
-            send_telegram(msg)
-
-class SmartMoneyTracker:
-    def __init__(self):
-        self.tracked_wallets = {}
-
-    def refresh_wallets(self):
-        logger.info("[SmartMoney] Layer 3: Validating track records...")
-        entries = api_get(f"{BASE_DATA_API}/v1/leaderboard", {"timePeriod": "ALL", "orderBy": "PNL", "limit": 100})
-        if not entries: return
-
-        valid = {}
-        for entry in entries:
-            addr = entry.get("proxyWallet")
-            if not addr: continue
-            
-            # THE FIX: Using REALIZEDPNL to prevent 400 error
-            closed = api_get(f"{BASE_DATA_API}/closed-positions", {
-                "user": addr, "limit": 100, "sortBy": "REALIZEDPNL", "sortDirection": "DESC"
-            })
-            if not closed or len(closed) < SMART_MONEY["min_closed_positions"]: continue
-            
-            wins = sum(1 for p in closed if float(p.get("cashPnl") or 0) > 0)
-            wr = wins / len(closed)
-            
-            if wr >= SMART_MONEY["min_win_rate"]:
-                valid[addr] = SmartWallet(address=addr, username=entry.get("userName") or addr[:10], win_rate=wr)
-                logger.info(f" ✓ Verified: {entry.get('userName')} ({wr:.0%})")
-            time.sleep(0.1)
-        self.tracked_wallets = valid
-
-    def check_trades(self):
-        lookback = int(time.time()) - SMART_MONEY["activity_lookback_seconds"]
-        for addr, sw in self.tracked_wallets.items():
-            trades = api_get(f"{BASE_DATA_API}/activity", {"user": addr, "type": "TRADE", "side": "BUY", "start": lookback})
-            if not trades: continue
-            for t in trades:
-                ts = int(t.get("timestamp") or 0)
-                if ts <= sw.last_seen_trade_ts: continue
-                sw.last_seen_trade_ts = ts
-                
-                usd = float(t.get("size", 0)) * float(t.get("price", 0))
-                if usd < SMART_MONEY["min_trade_size_usd"]: continue
-                
-                msg = (
-                    f"🔥 <b>SMART MONEY ALERT</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 <b>{sw.username}</b> (WR: {sw.win_rate:.0%})\n"
-                    f"💰 Bet: <b>${usd:,.0f}</b> on <i>{t.get('outcome')}</i>\n"
-                    f"❓ {t.get('title')}\n\n"
-                    f"🔗 <a href='https://polymarket.com/event/{t.get('slug')}'>View Market</a>"
-                )
-                send_telegram(msg)
+    def format_message(self, tip):
+        """Creates the English post for Telegram."""
+        now = datetime.now(timezone.utc).strftime("%B %d, %Y")
+        
+        msg = f"🌟 <b>POLYMARKET: TIP OF THE DAY</b> 🌟\n"
+        msg += f"📅 <i>{now}</i>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg += f"🎯 <b>MARKET:</b>\n{tip['question']}\n\n"
+        msg += f"✅ <b>RECOMMENDED BET:</b> {tip['outcome'].upper()}\n"
+        msg += f"📈 <b>PROBABILITY:</b> {tip['prob']:.1f}%\n"
+        msg += f"💰 <b>POTENTIAL ROI:</b> +{tip['roi']:.1f}%\n\n"
+        msg += f"📊 <b>MARKET STATS:</b>\n"
+        msg += f"• Volume: ${tip['vol']:,.0f}\n"
+        msg += f"• Liquidity: ${tip['liq']:,.0f}\n\n"
+        msg += f"🔗 <a href='https://polymarket.com/event/{tip['slug']}'>TRADE ON POLYMARKET</a>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "💎 <i>Shared via Polymarket Analytics Bot</i>"
+        return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXECUTION
+# SERVER & LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
+
 @app.route("/")
-def health(): return "OK", 200
+def health(): return "Bot Active", 200
 
 def bot_main_loop():
-    scanner = MarketScanner()
-    tracker = SmartMoneyTracker()
-    last_scan = 0
-    last_refresh = 0
+    engine = DailyTipEngine()
+    logger.info("🚀 Daily Tip Engine Started")
     
     while True:
-        now = time.time()
-        if now - last_scan > MARKET_SCANNER["scan_interval_hours"] * 3600:
-            scanner.run_cycle(); last_scan = now
-        
-        if now - last_refresh > SMART_MONEY["leaderboard_refresh_hours"] * 3600:
-            tracker.refresh_wallets(); last_refresh = now
+        try:
+            logger.info("Scanning for the best daily tip...")
+            raw_markets = engine.fetch_all_active_markets()
+            best_tip = engine.select_best_tip(raw_markets)
             
-        tracker.check_trades()
-        time.sleep(SMART_MONEY["trade_poll_seconds"])
+            if best_tip:
+                message = engine.format_message(best_tip)
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                }
+                requests.post(url, json=payload, timeout=15)
+                logger.info(f"Daily tip posted: {best_tip['question']}")
+            else:
+                logger.warning("No suitable markets found today.")
+
+            # Wait for the next interval
+            time.sleep(POST_INTERVAL_HOURS * 3600)
+            
+        except Exception as e:
+            logger.error(f"Loop error: {e}")
+            time.sleep(300)
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_main_loop, daemon=True).start() # <--- Update this too
+    threading.Thread(target=bot_main_loop, daemon=True).start()
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
