@@ -93,6 +93,7 @@ def bot_main_loop():
     
     while True:
         try:
+            logger.info("Scanning for the daily top pick...")
             raw = engine.fetch_markets()
             best_tip = engine.get_best_daily_signal(raw)
             
@@ -104,14 +105,21 @@ def bot_main_loop():
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
-                requests.post(url, json=payload, timeout=15)
-                logger.info(f"Daily signal posted: {best_tip['q']}")
-            
-            # Wait for the next 24-hour cycle
-            time.sleep(POST_INTERVAL_HOURS * 3600)
-            
+                resp = requests.post(url, json=payload, timeout=15)
+                
+                if resp.status_code == 200:
+                    logger.info(f"✅ Success: Daily signal posted for {best_tip['q']}")
+                    # SUCCESS: Now wait 24 hours for the next one
+                    time.sleep(POST_INTERVAL_HOURS * 3600)
+                else:
+                    logger.error(f"❌ Telegram Error: {resp.text}")
+                    time.sleep(300) # Wait 5 mins and try again if Telegram failed
+            else:
+                logger.warning("⚠️ No suitable markets found. Retrying in 10 minutes...")
+                time.sleep(600) # If no market found, don't sleep 24h, just wait 10 mins
+                
         except Exception as e:
-            logger.error(f"Loop error: {e}")
+            logger.error(f"💥 Critical Loop error: {e}")
             time.sleep(300)
 
 if __name__ == "__main__":
