@@ -24,33 +24,41 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("polybot")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PRO-ANALYTICS ENGINE (RELAXED FILTERS)
+# PRO-ANALYTICS ENGINE (ULTRA-RESISTANT)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ProAnalyticsEngine:
     def fetch_markets(self):
         try:
-            # Pedimos los 100 mercados más activos
+            # Pedimos los 100 mercados más activos por volumen
             params = {"limit": 100, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
-        except: return []
+        except Exception as e:
+            logger.error(f"Error fetching API: {e}")
+            return []
 
     def get_best_daily_signal(self, markets):
         scored_list = []
+        if not markets: return None
+
         for m in markets:
             try:
+                # Extraer datos básicos con seguridad
                 vol = float(m.get("volume", 0) or 0)
                 liq = float(m.get("liquidity", 0) or 0)
                 tokens = m.get("tokens", [])
                 
+                # Si no hay tokens, saltamos este mercado
+                if not tokens: continue
+                
                 for t in tokens:
                     price = float(t.get("price", 0) or 0)
-                    # Filtro relajado: cualquier apuesta entre 10% y 90%
-                    if 0.10 < price < 0.90:
+                    # Filtro amplio: probabilidad entre 5% y 95%
+                    if 0.05 < price < 0.95:
                         roi = ((1 / price) - 1) * 100
-                        # Puntuación simplificada para asegurar resultados
-                        score = (vol * 1.0) + (liq * 0.5) + (roi * 2)
+                        # Puntuación: Volumen (50%) + ROI (50%)
+                        score = (vol * 0.1) + (roi * 10)
                         
                         scored_list.append({
                             "q": m.get("question"), "out": t.get("outcome"),
@@ -59,18 +67,20 @@ class ProAnalyticsEngine:
                         })
             except: continue
         
-        # Si no hay nada con los filtros, devolvemos el mercado con más volumen puro
-        if not scored_list and markets:
-            logger.info("⚠️ No markets passed scores, selecting top volume market instead.")
-            m = markets[0] # El primero por volumen
-            t = m['tokens'][0]
-            price = float(t.get('price', 0.5))
-            return {
-                "q": m.get("question"), "out": t.get("outcome"),
-                "prob": price * 100, "roi": ((1/price)-1)*100 if price > 0 else 0,
-                "vol": float(m.get("volume", 0)), "liq": float(m.get("liquidity", 0)),
-                "slug": m.get("slug"), "score": 0
-            }
+        # PLAN B: Si nada pasa el filtro, forzamos el mejor mercado disponible
+        if not scored_list:
+            logger.info("⚠️ No markets passed score filters. Forcing best available...")
+            for m in markets:
+                tokens = m.get("tokens", [])
+                if tokens:
+                    t = tokens[0]
+                    price = float(t.get("price", 0.5))
+                    return {
+                        "q": m.get("question"), "out": t.get("outcome"),
+                        "prob": price * 100, "roi": ((1/price)-1)*100 if price > 0 else 0,
+                        "vol": float(m.get("volume", 0)), "liq": float(m.get("liquidity", 0)),
+                        "slug": m.get("slug"), "score": 0
+                    }
             
         return max(scored_list, key=lambda x: x["score"]) if scored_list else None
 
@@ -88,16 +98,16 @@ class ProAnalyticsEngine:
         msg += f"• Liquidity: ${tip['liq']:,.0f}\n\n"
         msg += f"🔗 <a href='https://polymarket.com/event/{tip['slug']}'>Open in Polymarket</a>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "💎 <i>Shared via @TuCanalDeTelegram</i>"
+        msg += "💎 <i>Shared via Polymarket Tipster</i>"
         return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP WITH GUARANTEED DELIVERY
+# MAIN LOOP (FIXED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 @app.route("/")
-def health(): return "Engine Online", 200
+def health(): return "OK", 200
 
 def bot_main_loop():
     engine = ProAnalyticsEngine()
@@ -110,7 +120,7 @@ def bot_main_loop():
             best_tip = engine.get_best_daily_signal(raw)
             
             if best_tip:
-                logger.info(f"✅ Tip found: {best_tip['q']}")
+                logger.info(f"✅ Tip selected: {best_tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
@@ -121,19 +131,20 @@ def bot_main_loop():
                 resp = requests.post(url, json=payload, timeout=15)
                 
                 if resp.status_code == 200:
-                    logger.info(f"📱 Message sent! Sleeping {POST_INTERVAL_HOURS} hours.")
+                    logger.info(f"📱 Message sent successfully. Waiting {POST_INTERVAL_HOURS} hours.")
                     time.sleep(POST_INTERVAL_HOURS * 3600)
                 else:
                     logger.error(f"❌ Telegram Error: {resp.text}")
                     time.sleep(300)
             else:
-                logger.warning("⚠️ Still no markets found. Checking again in 5 mins...")
-                time.sleep(300)
+                logger.warning("⚠️ No markets found at all. Retrying in 10 minutes...")
+                time.sleep(600)
                 
         except Exception as e:
-            logger.error(f"💥 Error: {e}")
+            logger.error(f"💥 Critical Error: {e}")
             time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_main_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
