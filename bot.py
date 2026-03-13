@@ -18,13 +18,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
-# Cambio a endpoint de EVENTS para mayor estabilidad en 2026
 GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Memoria para evitar repetir el mismo mercado
+# Global memory
 last_posted_slug = ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -33,15 +32,8 @@ last_posted_slug = ""
 
 class DailySignalEngine:
     def fetch_events(self):
-        """Obtiene los eventos activos más importantes."""
         try:
-            params = {
-                "limit": 50,
-                "active": "true",
-                "closed": "false",
-                "order": "volume",
-                "ascending": "false"
-            }
+            params = {"limit": 50, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_EVENTS_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
         except Exception as e:
@@ -55,27 +47,23 @@ class DailySignalEngine:
         candidates = []
         for e in events:
             slug = e.get("slug")
-            # Ignoramos si es el mismo de ayer o si es el de BitBoy (para variar)
-            if slug == last_posted_slug or "bitboy" in slug.lower():
+            # Skip if it's exactly the same as the last one we posted
+            if slug == last_posted_slug:
                 continue
 
             markets = e.get("markets", [])
             if not markets: continue
 
-            # Buscamos el mercado principal de este evento
             for m in markets:
                 try:
-                    # En 2026, el precio puede estar en 'outcomePrices' o 'group_id'
                     prices = m.get("outcomePrices")
                     if not prices: continue
                     
-                    # Tomamos el primer precio (normalmente el 'YES')
                     price = float(prices[0])
                     vol = float(e.get("volume", 0) or 0)
                     
                     if 0.05 < price < 0.95:
                         roi = ((1 / price) - 1) * 100
-                        # Puntuación equilibrada
                         score = (vol * 0.5) + (roi * 10)
                         
                         candidates.append({
@@ -92,17 +80,12 @@ class DailySignalEngine:
         if candidates:
             return max(candidates, key=lambda x: x["score"])
         
-        # FALLBACK: Si todo falla, toma el primer evento con volumen
-        logger.info("⚠️ No ideal markets found. Forcing first active event.")
+        # Fallback to the top event if everything else is filtered
         first = events[0]
         return {
-            "q": first.get("title"),
-            "out": "Outcome",
-            "prob": 50.0,
-            "roi": 100.0,
-            "vol": float(first.get("volume", 0)),
-            "slug": first.get("slug"),
-            "score": 0
+            "q": first.get("title"), "out": "OUTCOME", "prob": 50.0,
+            "roi": 100.0, "vol": float(first.get("volume", 0)),
+            "slug": first.get("slug"), "score": 0
         }
 
     def format_post(self, tip):
@@ -117,7 +100,7 @@ class DailySignalEngine:
         msg += f"📊 <b>STATS:</b> Vol ${tip['vol']:,.0f}\n\n"
         msg += f"🔗 <a href='https://polymarket.com/event/{tip['slug']}'>Trade on Polymarket</a>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "💎 <i>Shared via @TuCanalDeTelegram</i>"
+        msg += "💎 <b>Shared via @polymsignals</b>"
         return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,15 +114,19 @@ def health(): return "OK", 200
 def bot_main_loop():
     global last_posted_slug
     engine = DailySignalEngine()
-    logger.info("🚀 Professional Daily Signal Engine Started")
     
+    # ─── RENDER PROTECTION ───
+    # Wait 60 seconds after startup to prevent duplicate "restart" posts
+    logger.info("🚀 Bot started. Waiting 60s for stability...")
+    time.sleep(60)
+
     while True:
         try:
             logger.info("🔎 Scanning events...")
             raw_events = engine.fetch_events()
             tip = engine.get_best_tip(raw_events)
             
-            if tip:
+            if tip and tip['slug'] != last_posted_slug:
                 logger.info(f"✅ Selected: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
@@ -154,8 +141,8 @@ def bot_main_loop():
                 logger.info(f"📱 Posted! Waiting {POST_INTERVAL_HOURS} hours.")
                 time.sleep(POST_INTERVAL_HOURS * 3600)
             else:
-                logger.warning("No data from API. Retrying in 5 mins...")
-                time.sleep(300)
+                logger.info("No new market found yet. Checking again in 15 mins.")
+                time.sleep(900)
                 
         except Exception as e:
             logger.error(f"Error: {e}")
