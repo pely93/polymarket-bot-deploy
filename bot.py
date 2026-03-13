@@ -16,7 +16,6 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Lo ideal es ponerlo en 24, pero si quieres más actividad puedes bajarlo a 12
 POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
@@ -24,17 +23,18 @@ GAMMA_API = "https://gamma-api.polymarket.com/markets"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Memoria temporal (Se limpia al reiniciar, lo cual es bueno para forzar posts)
-last_posted_slugs = []
+# Memoria de los últimos mercados para evitar repeticiones (Se limpia al reiniciar)
+last_posted_slug = ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE: DAILY SIGNAL (MAX ACTIVITY MODE)
+# ENGINE: ULTRA-DIVERSITY SCANNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DailySignalEngine:
     def fetch_markets(self):
-        """Intenta obtener los 100 mercados con más volumen."""
+        """Intenta obtener mercados con volumen real, sin filtros de búsqueda agresivos."""
         try:
+            # Traemos más mercados (100) para tener de donde elegir
             params = {"limit": 100, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
@@ -42,51 +42,44 @@ class DailySignalEngine:
             logger.error(f"Error API: {e}")
             return []
 
-    def select_best_tip(self, markets):
-        """Busca el mejor mercado que no esté en la lista de repetidos."""
+    def select_fresh_tip(self, markets):
+        """Busca una opción que no sea la anterior y que tenga sentido."""
+        global last_posted_slug
         candidates = []
+        
         for m in markets:
             slug = m.get("slug")
-            if not slug or slug in last_posted_slugs:
+            # Ignoramos si es el mismo de la última vez o si es BitBoy por tercera vez
+            if slug == last_posted_slug:
+                continue
+            
+            # Filtro de palabras clave para variar el contenido
+            if "bitboy" in slug.lower() and last_posted_slug and "bitboy" in last_posted_slug.lower():
                 continue
 
             tokens = m.get("tokens", [])
             if not tokens: continue
             
-            # Buscamos el token con precio más razonable (evitamos 0.99 o 0.01)
             for t in tokens:
                 try:
                     price = float(t.get("price", 0) or 0)
-                    if 0.05 < price < 0.95:
+                    # Buscamos apuestas con valor real (ROI > 10%)
+                    if 0.10 < price < 0.90:
                         vol = float(m.get("volume", 0) or 0)
-                        roi = ((1 / price) - 1) * 100
-                        # Puntuación: Volumen + un extra por ROI
-                        score = vol + (roi * 10)
+                        # Score: Volumen + Diversidad
+                        score = vol * (1.2 if "bitcoin" in slug.lower() else 1.0)
                         
                         candidates.append({
                             "q": m["question"], "out": t.get("outcome", "YES"),
-                            "prob": price * 100, "roi": roi, "vol": vol,
-                            "slug": slug, "score": score
+                            "prob": price * 100, "roi": ((1/price)-1)*100,
+                            "vol": vol, "slug": slug, "score": score
                         })
                 except: continue
 
-        # Ordenar por puntuación y devolver el mejor
         if candidates:
-            return max(candidates, key=lambda x: x["score"])
+            # Ordenamos por score y tomamos el mejor de los NUEVOS
+            return sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
         
-        # SI NO HAY CANDIDATOS NUEVOS: Forzar el primer mercado con volumen que no sea BitBoy
-        logger.info("⚠️ Forzando selección para evitar canal vacío...")
-        for m in markets:
-            if "bitboy" not in m.get("slug", "").lower():
-                tokens = m.get("tokens", [])
-                if tokens:
-                    t = tokens[0]
-                    price = float(t.get("price", 0.5))
-                    return {
-                        "q": m.get("question"), "out": t.get("outcome", "YES"),
-                        "prob": price * 100, "roi": ((1/price)-1)*100 if price > 0 else 100,
-                        "vol": float(m.get("volume", 0)), "slug": m.get("slug"), "score": 0
-                    }
         return None
 
     def format_post(self, tip):
@@ -101,7 +94,7 @@ class DailySignalEngine:
         msg += f"📊 <b>STATS:</b> Vol ${tip['vol']:,.0f}\n\n"
         msg += f"🔗 <a href='https://polymarket.com/event/{tip['slug']}'>Trade on Polymarket</a>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "💎 <i>Selection based on Whale Activity</i>"
+        msg += "💎 <i>Live Intelligence by PolymarketBot</i>"
         return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -113,18 +106,18 @@ app = Flask(__name__)
 def health(): return "OK", 200
 
 def bot_main_loop():
-    global last_posted_slugs
+    global last_posted_slug
     engine = DailySignalEngine()
-    logger.info("🚀 Bot Loop Started")
+    logger.info("🚀 Professional Daily Signal Engine Started")
     
     while True:
         try:
-            logger.info("🔎 Scanning for a tip...")
+            logger.info("🔎 Scanning for a FRESH tip...")
             raw_markets = engine.fetch_markets()
-            tip = engine.select_best_tip(raw_markets)
+            tip = engine.select_fresh_tip(raw_markets)
             
             if tip:
-                logger.info(f"✅ Sending Tip: {tip['q']}")
+                logger.info(f"✅ Sending New Tip: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
@@ -134,14 +127,11 @@ def bot_main_loop():
                 }
                 requests.post(url, json=payload, timeout=15)
                 
-                # Guardar en memoria y esperar ciclo largo
-                last_posted_slugs.append(tip['slug'])
-                if len(last_posted_slugs) > 10: last_posted_slugs.pop(0)
-                
-                logger.info(f"📱 Posted! Waiting {POST_INTERVAL_HOURS} hours.")
+                last_posted_slug = tip['slug']
+                logger.info(f"📱 Posted! Next check in {POST_INTERVAL_HOURS} hours.")
                 time.sleep(POST_INTERVAL_HOURS * 3600)
             else:
-                logger.warning("No market found. Retrying in 5 minutes...")
+                logger.warning("No NEW market found. Retrying in 5 minutes...")
                 time.sleep(300)
                 
         except Exception as e:
