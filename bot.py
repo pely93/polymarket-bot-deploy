@@ -16,18 +16,20 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
+# Forzamos a que revise cada hora, pero solo postee una vez por fecha
+SCAN_INTERVAL_SECONDS = 3600 
 
 GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Global memory
+# Variables de estado (Se mantienen mientras el proceso esté vivo)
+last_post_date = "" # Formato YYYY-MM-DD
 last_posted_slug = ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# THE "GUARANTEED TIP" ENGINE
+# ENGINE: DAILY GUARANTEE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DailySignalEngine:
@@ -40,14 +42,14 @@ class DailySignalEngine:
             logger.error(f"API Error: {e}")
             return []
 
-    def get_best_tip(self, events):
+    def get_daily_tip(self, events):
         global last_posted_slug
         if not events: return None
 
         candidates = []
         for e in events:
             slug = e.get("slug")
-            # Skip if it's exactly the same as the last one we posted
+            # Evitamos repetir el mismo mercado exacto
             if slug == last_posted_slug:
                 continue
 
@@ -62,9 +64,10 @@ class DailySignalEngine:
                     price = float(prices[0])
                     vol = float(e.get("volume", 0) or 0)
                     
-                    if 0.05 < price < 0.95:
+                    # Filtro de calidad para el post diario
+                    if 0.10 < price < 0.90:
                         roi = ((1 / price) - 1) * 100
-                        score = (vol * 0.5) + (roi * 10)
+                        score = (vol * 0.8) + (roi * 10) # Priorizamos volumen
                         
                         candidates.append({
                             "q": e.get("title", m.get("question")),
@@ -77,16 +80,11 @@ class DailySignalEngine:
                         })
                 except: continue
 
+        # Devolvemos el mejor que no hayamos posteado
         if candidates:
             return max(candidates, key=lambda x: x["score"])
         
-        # Fallback to the top event if everything else is filtered
-        first = events[0]
-        return {
-            "q": first.get("title"), "out": "OUTCOME", "prob": 50.0,
-            "roi": 100.0, "vol": float(first.get("volume", 0)),
-            "slug": first.get("slug"), "score": 0
-        }
+        return None
 
     def format_post(self, tip):
         now = datetime.now(timezone.utc).strftime("%B %d, %Y")
@@ -112,22 +110,28 @@ app = Flask(__name__)
 def health(): return "OK", 200
 
 def bot_main_loop():
-    global last_posted_slug
+    global last_post_date, last_posted_slug
     engine = DailySignalEngine()
     
-    # ─── RENDER PROTECTION ───
-    # Wait 60 seconds after startup to prevent duplicate "restart" posts
-    logger.info("🚀 Bot started. Waiting 60s for stability...")
-    time.sleep(60)
+    logger.info("🚀 Bot started. Waiting 30s for stability...")
+    time.sleep(30)
 
     while True:
         try:
-            logger.info("🔎 Scanning events...")
-            raw_events = engine.fetch_events()
-            tip = engine.get_best_tip(raw_events)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             
-            if tip and tip['slug'] != last_posted_slug:
-                logger.info(f"✅ Selected: {tip['q']}")
+            # Si ya posteamos hoy, esperamos a la siguiente revisión
+            if last_post_date == today:
+                logger.info(f"📅 Ya se publicó el post de hoy ({today}). Durmiendo 1 hora...")
+                time.sleep(3600)
+                continue
+
+            logger.info(f"🔎 Buscando el post para hoy: {today}")
+            raw_events = engine.fetch_events()
+            tip = engine.get_daily_tip(raw_events)
+            
+            if tip:
+                logger.info(f"✅ Seleccionado para hoy: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
@@ -135,14 +139,17 @@ def bot_main_loop():
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
-                requests.post(url, json=payload, timeout=15)
+                resp = requests.post(url, json=payload, timeout=15)
                 
-                last_posted_slug = tip['slug']
-                logger.info(f"📱 Posted! Waiting {POST_INTERVAL_HOURS} hours.")
-                time.sleep(POST_INTERVAL_HOURS * 3600)
-            else:
-                logger.info("No new market found yet. Checking again in 15 mins.")
-                time.sleep(900)
+                if resp.status_code == 200:
+                    last_post_date = today
+                    last_posted_slug = tip['slug']
+                    logger.info("📱 Post enviado con éxito.")
+                else:
+                    logger.error(f"❌ Error de Telegram: {resp.text}")
+            
+            # Revisar cada hora
+            time.sleep(SCAN_INTERVAL_SECONDS)
                 
         except Exception as e:
             logger.error(f"Error: {e}")
