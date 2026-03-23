@@ -16,42 +16,40 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Forzamos a que revise cada hora, pero solo postee una vez por fecha
-SCAN_INTERVAL_SECONDS = 3600 
+POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
 GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Variables de estado (Se mantienen mientras el proceso esté vivo)
-last_post_date = "" # Formato YYYY-MM-DD
+# Memoria temporal
 last_posted_slug = ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE: DAILY GUARANTEE
+# ENGINE: AGGRESSIVE REPORTER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DailySignalEngine:
     def fetch_events(self):
         try:
+            # Traemos los 50 eventos con más volumen histórico
             params = {"limit": 50, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_EVENTS_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
         except Exception as e:
-            logger.error(f"API Error: {e}")
+            logger.error(f"Error API: {e}")
             return []
 
-    def get_daily_tip(self, events):
+    def get_any_good_tip(self, events):
         global last_posted_slug
         if not events: return None
 
         candidates = []
         for e in events:
             slug = e.get("slug")
-            # Evitamos repetir el mismo mercado exacto
-            if slug == last_posted_slug:
-                continue
+            # Solo saltamos si es exactamente el último que publicamos en esta sesión
+            if slug == last_posted_slug: continue
 
             markets = e.get("markets", [])
             if not markets: continue
@@ -64,10 +62,10 @@ class DailySignalEngine:
                     price = float(prices[0])
                     vol = float(e.get("volume", 0) or 0)
                     
-                    # Filtro de calidad para el post diario
-                    if 0.10 < price < 0.90:
+                    # Filtro MUY relajado: que tenga un precio y volumen
+                    if 0.02 < price < 0.98:
                         roi = ((1 / price) - 1) * 100
-                        score = (vol * 0.8) + (roi * 10) # Priorizamos volumen
+                        score = vol + (roi * 5)
                         
                         candidates.append({
                             "q": e.get("title", m.get("question")),
@@ -80,11 +78,18 @@ class DailySignalEngine:
                         })
                 except: continue
 
-        # Devolvemos el mejor que no hayamos posteado
         if candidates:
-            return max(candidates, key=lambda x: x["score"])
+            # Retornamos el de mayor puntuación
+            return sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
         
-        return None
+        # FALLBACK EXTREMO: Si nada pasa el filtro, enviamos el #1 en volumen
+        logger.info("⚠️ Sin candidatos ideales. Enviando Top Volume por defecto.")
+        top = events[0]
+        return {
+            "q": top.get("title"), "out": "YES/OUTCOME", "prob": 50.0,
+            "roi": 100.0, "vol": float(top.get("volume", 0)),
+            "slug": top.get("slug"), "score": 0
+        }
 
     def format_post(self, tip):
         now = datetime.now(timezone.utc).strftime("%B %d, %Y")
@@ -110,28 +115,21 @@ app = Flask(__name__)
 def health(): return "OK", 200
 
 def bot_main_loop():
-    global last_post_date, last_posted_slug
+    global last_posted_slug
     engine = DailySignalEngine()
     
-    logger.info("🚀 Bot started. Waiting 30s for stability...")
-    time.sleep(30)
+    # Reducimos la espera de estabilidad a solo 10 segundos
+    logger.info("🚀 Bot iniciado. Escaneando de inmediato...")
+    time.sleep(10)
 
     while True:
         try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            
-            # Si ya posteamos hoy, esperamos a la siguiente revisión
-            if last_post_date == today:
-                logger.info(f"📅 Ya se publicó el post de hoy ({today}). Durmiendo 1 hora...")
-                time.sleep(3600)
-                continue
-
-            logger.info(f"🔎 Buscando el post para hoy: {today}")
+            logger.info("🔎 Buscando señal activa...")
             raw_events = engine.fetch_events()
-            tip = engine.get_daily_tip(raw_events)
+            tip = engine.get_any_good_tip(raw_events)
             
             if tip:
-                logger.info(f"✅ Seleccionado para hoy: {tip['q']}")
+                logger.info(f"✅ Publicando: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
@@ -139,20 +137,19 @@ def bot_main_loop():
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
-                resp = requests.post(url, json=payload, timeout=15)
+                requests.post(url, json=payload, timeout=15)
                 
-                if resp.status_code == 200:
-                    last_post_date = today
-                    last_posted_slug = tip['slug']
-                    logger.info("📱 Post enviado con éxito.")
-                else:
-                    logger.error(f"❌ Error de Telegram: {resp.text}")
-            
-            # Revisar cada hora
-            time.sleep(SCAN_INTERVAL_SECONDS)
+                last_posted_slug = tip['slug']
+                
+                # Esperamos el tiempo definido (ej. 24 horas)
+                logger.info(f"📱 Post enviado. Esperando {POST_INTERVAL_HOURS} horas...")
+                time.sleep(POST_INTERVAL_HOURS * 3600)
+            else:
+                logger.warning("No se encontró nada. Reintentando en 5 minutos.")
+                time.sleep(300)
                 
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error en el bucle: {e}")
             time.sleep(300)
 
 if __name__ == "__main__":
