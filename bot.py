@@ -3,8 +3,9 @@ import sys
 import time
 import logging
 import threading
+import random
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -18,38 +19,43 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
-GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
+GAMMA_API = "https://gamma-api.polymarket.com/events"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Memoria temporal
+# Global memory to prevent repeats across restarts (if possible)
 last_posted_slug = ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE: AGGRESSIVE REPORTER
+# DIVERSITY ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DailySignalEngine:
-    def fetch_events(self):
+class DiversityEngine:
+    def fetch_data(self):
         try:
-            # Traemos los 50 eventos con más volumen histórico
-            params = {"limit": 50, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
-            resp = requests.get(GAMMA_EVENTS_API, params=params, timeout=20)
+            # We fetch 100 markets to have a large pool for variety
+            params = {"limit": 100, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
+            resp = requests.get(GAMMA_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
-        except Exception as e:
-            logger.error(f"Error API: {e}")
-            return []
+        except: return []
 
-    def get_any_good_tip(self, events):
+    def select_unique_tip(self, events):
         global last_posted_slug
-        if not events: return None
-
         candidates = []
+        
+        # Keywords to IGNORE (The ones that get stuck at the top)
+        blacklist = ["2028", "presidential nominee", "convicted", "bitboy"]
+
         for e in events:
-            slug = e.get("slug")
-            # Solo saltamos si es exactamente el último que publicamos en esta sesión
+            slug = e.get("slug", "")
+            title = e.get("title", "").lower()
+            
+            # 1. Skip if it's the same as the last post
             if slug == last_posted_slug: continue
+            
+            # 2. Skip if it's in the blacklist
+            if any(word in title for word in blacklist): continue
 
             markets = e.get("markets", [])
             if not markets: continue
@@ -62,36 +68,27 @@ class DailySignalEngine:
                     price = float(prices[0])
                     vol = float(e.get("volume", 0) or 0)
                     
-                    # Filtro MUY relajado: que tenga un precio y volumen
-                    if 0.02 < price < 0.98:
+                    # We want markets with real action but decent ROI
+                    if 0.10 < price < 0.85:
                         roi = ((1 / price) - 1) * 100
-                        score = vol + (roi * 5)
+                        # Score: Prioritize Volume, but add a random factor for variety
+                        score = (vol * 0.7) + (roi * 5)
                         
                         candidates.append({
-                            "q": e.get("title", m.get("question")),
-                            "out": m.get("outcomes", ["Yes", "No"])[0],
-                            "prob": price * 100,
-                            "roi": roi,
-                            "vol": vol,
-                            "slug": slug,
-                            "score": score
+                            "q": e.get("title"), "out": m.get("outcomes", ["Yes", "No"])[0],
+                            "prob": price * 100, "roi": roi, "vol": vol,
+                            "slug": slug, "score": score
                         })
                 except: continue
 
-        if candidates:
-            # Retornamos el de mayor puntuación
-            return sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
-        
-        # FALLBACK EXTREMO: Si nada pasa el filtro, enviamos el #1 en volumen
-        logger.info("⚠️ Sin candidatos ideales. Enviando Top Volume por defecto.")
-        top = events[0]
-        return {
-            "q": top.get("title"), "out": "YES/OUTCOME", "prob": 50.0,
-            "roi": 100.0, "vol": float(top.get("volume", 0)),
-            "slug": top.get("slug"), "score": 0
-        }
+        if not candidates: return None
 
-    def format_post(self, tip):
+        # 3. SORT & SHUFFLE: Take the top 10 best and pick a RANDOM one
+        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+        top_pool = candidates[:10] 
+        return random.choice(top_pool)
+
+    def format_message(self, tip):
         now = datetime.now(timezone.utc).strftime("%B %d, %Y")
         msg = f"🏆 <b>POLYMARKET: DAILY TOP PICK</b> 🏆\n"
         msg += f"📅 <i>{now}</i>\n"
@@ -112,45 +109,40 @@ class DailySignalEngine:
 
 app = Flask(__name__)
 @app.route("/")
-def health(): return "OK", 200
+def health(): return "Engine Online", 200
 
 def bot_main_loop():
     global last_posted_slug
-    engine = DailySignalEngine()
+    engine = DiversityEngine()
     
-    # Reducimos la espera de estabilidad a solo 10 segundos
-    logger.info("🚀 Bot iniciado. Escaneando de inmediato...")
-    time.sleep(10)
+    # Wait for Render to settle
+    time.sleep(30)
 
     while True:
         try:
-            logger.info("🔎 Buscando señal activa...")
-            raw_events = engine.fetch_events()
-            tip = engine.get_any_good_tip(raw_events)
+            raw = engine.fetch_data()
+            tip = engine.select_unique_tip(raw)
             
             if tip:
-                logger.info(f"✅ Publicando: {tip['q']}")
+                logger.info(f"✅ Selected new market: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": engine.format_post(tip),
+                    "text": engine.format_message(tip),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
                 requests.post(url, json=payload, timeout=15)
                 
                 last_posted_slug = tip['slug']
-                
-                # Esperamos el tiempo definido (ej. 24 horas)
-                logger.info(f"📱 Post enviado. Esperando {POST_INTERVAL_HOURS} horas...")
+                # Sleep for 24 hours (or your config)
                 time.sleep(POST_INTERVAL_HOURS * 3600)
             else:
-                logger.warning("No se encontró nada. Reintentando en 5 minutos.")
-                time.sleep(300)
+                logger.warning("No new unique markets found. Retrying in 1 hour.")
+                time.sleep(3600)
                 
         except Exception as e:
-            logger.error(f"Error en el bucle: {e}")
-            time.sleep(300)
+            logger.error(f"Error: {e}"); time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_main_loop, daemon=True).start()
