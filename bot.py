@@ -5,7 +5,7 @@ import logging
 import threading
 import random
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -24,71 +24,55 @@ GAMMA_API = "https://gamma-api.polymarket.com/events"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
-# Global memory to prevent repeats across restarts (if possible)
-last_posted_slug = ""
+# Memory of the last 15 markets to ensure 100% variety for over two weeks
+posted_history = []
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DIVERSITY ENGINE
+# RANDOM SELECTION ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DiversityEngine:
-    def fetch_data(self):
+class RandomSignalEngine:
+    def fetch_pool(self):
+        """Gets a large pool of active events."""
         try:
-            # We fetch 100 markets to have a large pool for variety
-            params = {"limit": 100, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
+            params = {"limit": 50, "active": "true", "closed": "false"}
             resp = requests.get(GAMMA_API, params=params, timeout=20)
             return resp.json() if resp.status_code == 200 else []
         except: return []
 
-    def select_unique_tip(self, events):
-        global last_posted_slug
-        candidates = []
+    def get_random_unique_tip(self, events):
+        global posted_history
         
-        # Keywords to IGNORE (The ones that get stuck at the top)
-        blacklist = ["2028", "presidential nominee", "convicted", "bitboy"]
+        # Filter out anything we've posted recently
+        available = [e for e in events if e.get("slug") not in posted_history]
+        
+        if not available:
+            logger.warning("All pool markets recently posted. Resetting history.")
+            posted_history = []
+            available = events
 
-        for e in events:
-            slug = e.get("slug", "")
-            title = e.get("title", "").lower()
+        # Pick one at random
+        selected_event = random.choice(available)
+        markets = selected_event.get("markets", [])
+        
+        if not markets: return None
+
+        m = markets[0]
+        try:
+            prices = m.get("outcomePrices", [0.5, 0.5])
+            price = float(prices[0])
             
-            # 1. Skip if it's the same as the last post
-            if slug == last_posted_slug: continue
-            
-            # 2. Skip if it's in the blacklist
-            if any(word in title for word in blacklist): continue
+            return {
+                "q": selected_event.get("title", m.get("question")),
+                "out": m.get("outcomes", ["Yes", "No"])[0],
+                "prob": price * 100,
+                "roi": ((1/price)-1)*100 if price > 0 else 100,
+                "vol": float(selected_event.get("volume", 0) or 0),
+                "slug": selected_event.get("slug")
+            }
+        except: return None
 
-            markets = e.get("markets", [])
-            if not markets: continue
-
-            for m in markets:
-                try:
-                    prices = m.get("outcomePrices")
-                    if not prices: continue
-                    
-                    price = float(prices[0])
-                    vol = float(e.get("volume", 0) or 0)
-                    
-                    # We want markets with real action but decent ROI
-                    if 0.10 < price < 0.85:
-                        roi = ((1 / price) - 1) * 100
-                        # Score: Prioritize Volume, but add a random factor for variety
-                        score = (vol * 0.7) + (roi * 5)
-                        
-                        candidates.append({
-                            "q": e.get("title"), "out": m.get("outcomes", ["Yes", "No"])[0],
-                            "prob": price * 100, "roi": roi, "vol": vol,
-                            "slug": slug, "score": score
-                        })
-                except: continue
-
-        if not candidates: return None
-
-        # 3. SORT & SHUFFLE: Take the top 10 best and pick a RANDOM one
-        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-        top_pool = candidates[:10] 
-        return random.choice(top_pool)
-
-    def format_message(self, tip):
+    def format_post(self, tip):
         now = datetime.now(timezone.utc).strftime("%B %d, %Y")
         msg = f"🏆 <b>POLYMARKET: DAILY TOP PICK</b> 🏆\n"
         msg += f"📅 <i>{now}</i>\n"
@@ -109,37 +93,42 @@ class DiversityEngine:
 
 app = Flask(__name__)
 @app.route("/")
-def health(): return "Engine Online", 200
+def health(): return "OK", 200
 
 def bot_main_loop():
-    global last_posted_slug
-    engine = DiversityEngine()
+    global posted_history
+    engine = RandomSignalEngine()
     
-    # Wait for Render to settle
-    time.sleep(30)
+    # Small delay for Render startup
+    time.sleep(20)
 
     while True:
         try:
-            raw = engine.fetch_data()
-            tip = engine.select_unique_tip(raw)
+            logger.info("🎲 Picking a random unique market for subscribers...")
+            pool = engine.fetch_pool()
+            tip = engine.get_random_unique_tip(pool)
             
             if tip:
-                logger.info(f"✅ Selected new market: {tip['q']}")
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": engine.format_message(tip),
+                    "text": engine.format_post(tip),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
-                requests.post(url, json=payload, timeout=15)
+                resp = requests.post(url, json=payload, timeout=15)
                 
-                last_posted_slug = tip['slug']
-                # Sleep for 24 hours (or your config)
-                time.sleep(POST_INTERVAL_HOURS * 3600)
+                if resp.status_code == 200:
+                    posted_history.append(tip['slug'])
+                    if len(posted_history) > 15: posted_history.pop(0)
+                    
+                    logger.info(f"📱 Post Sent: {tip['q']}. Sleeping {POST_INTERVAL_HOURS}h.")
+                    time.sleep(POST_INTERVAL_HOURS * 3600)
+                else:
+                    logger.error("Telegram send failed. Retrying in 10m.")
+                    time.sleep(600)
             else:
-                logger.warning("No new unique markets found. Retrying in 1 hour.")
-                time.sleep(3600)
+                time.sleep(300)
                 
         except Exception as e:
             logger.error(f"Error: {e}"); time.sleep(300)
