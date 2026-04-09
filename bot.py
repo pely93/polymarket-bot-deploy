@@ -17,6 +17,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# This is now used as a "Goal". The bot will check every 15 mins if it needs to post.
 POST_INTERVAL_HOURS = float(os.getenv("POST_INTERVAL_HOURS", "24"))
 
 GAMMA_API = "https://gamma-api.polymarket.com/events"
@@ -24,63 +25,60 @@ GAMMA_API = "https://gamma-api.polymarket.com/events"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polybot")
 
+# PERSISTENT-LIKE MEMORY (Resets on restart, but we check timing)
+last_post_time = 0 
 posted_history = []
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REFINED SELECTION ENGINE
+# RELIABLE SELECTION ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RandomSignalEngine:
     def fetch_pool(self):
         try:
-            params = {"limit": 60, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
+            params = {"limit": 50, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_API, params=params, timeout=15)
             return resp.json() if resp.status_code == 200 else []
         except: return []
 
-    def get_random_unique_tip(self, events):
+    def get_tip(self, events):
         global posted_history
         if not events: return None
         
-        # Filtramos los que ya publicamos
+        # Filter pool for uniqueness
         available = [e for e in events if e.get("slug") not in posted_history]
         if not available:
             posted_history = []
             available = events
 
-        # Elegimos uno al azar
         selected_event = random.choice(available)
         markets = selected_event.get("markets", [])
         if not markets: return None
 
         m = markets[0]
         try:
-            # CORRECCIÓN DE PRECIOS Y POSICIÓN
-            # outcomePrices suele ser un string JSON en la API Gamma
-            prices_raw = m.get("outcomePrices", "[0.5, 0.5]")
-            if isinstance(prices_raw, str):
-                prices = json.loads(prices_raw)
-            else:
-                prices = prices_raw
-                
-            # Tomamos el primer outcome (YES o el nombre del favorito)
-            outcomes = m.get("outcomes", ["Yes", "No"])
-            if isinstance(outcomes, str):
-                outcomes = json.loads(outcomes)
+            # Robust price parsing
+            prices_raw = m.get("outcomePrices", [0.5, 0.5])
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            
+            # Outcome cleaning
+            outcomes_raw = m.get("outcomes", ["Yes", "No"])
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
 
             price = float(prices[0])
-            position_name = str(outcomes[0]) # Limpiamos el nombre para que no salga "["
+            # Ensure price is valid for ROI calculation
+            if price <= 0 or price >= 1: price = 0.5 
 
             return {
                 "q": selected_event.get("title", m.get("question")),
-                "out": position_name,
+                "out": str(outcomes[0]),
                 "prob": price * 100,
-                "roi": ((1/price)-1)*100 if price > 0 else 100,
+                "roi": ((1/price)-1)*100,
                 "vol": float(selected_event.get("volume", 0) or 0),
                 "slug": selected_event.get("slug")
             }
         except Exception as e:
-            logger.error(f"Data parse error: {e}")
+            logger.error(f"Selection error: {e}")
             return None
 
     def format_post(self, tip):
@@ -99,48 +97,59 @@ class RandomSignalEngine:
         return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXECUTION
+# EXECUTION LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 
 @app.route("/")
-def health(): return "Bot is healthy", 200
+def health(): return "Bot Running", 200
 
 def bot_main_loop():
-    global posted_history
+    global last_post_time, posted_history
     engine = RandomSignalEngine()
-    time.sleep(15) # Espera inicial para Render
-
+    
     while True:
         try:
-            logger.info("🎲 Scanning for market...")
-            pool = engine.fetch_pool()
-            tip = engine.get_random_unique_tip(pool)
+            current_time = time.time()
+            elapsed_time = current_time - last_post_time
             
-            if tip:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": engine.format_post(tip),
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                }
-                resp = requests.post(url, json=payload, timeout=15)
+            # Check if it's time to post (or if we've never posted since restart)
+            if elapsed_time >= (POST_INTERVAL_HOURS * 3600) or last_post_time == 0:
+                logger.info("🔎 Time for a new post. Scanning...")
+                pool = engine.fetch_pool()
+                tip = engine.get_tip(pool)
                 
-                if resp.status_code == 200:
-                    posted_history.append(tip['slug'])
-                    if len(posted_history) > 20: posted_history.pop(0)
-                    logger.info(f"📱 Sent: {tip['q']}. Waiting {POST_INTERVAL_HOURS}h.")
-                    time.sleep(POST_INTERVAL_HOURS * 3600)
+                if tip:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    payload = {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": engine.format_post(tip),
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True
+                    }
+                    resp = requests.post(url, json=payload, timeout=15)
+                    
+                    if resp.status_code == 200:
+                        last_post_time = time.time()
+                        posted_history.append(tip['slug'])
+                        logger.info(f"📱 Post Successful: {tip['q']}")
+                    else:
+                        logger.error(f"Telegram error: {resp.status_code}. Retrying in 10m.")
+                        time.sleep(600)
+                        continue
                 else:
-                    time.sleep(300)
-            else:
-                time.sleep(300)
+                    logger.warning("No market found. Retrying in 10m.")
+                    time.sleep(600)
+                    continue
+            
+            # Short sleep (15 mins) before checking the timer again
+            # This keeps the Render instance active with UptimeRobot
+            time.sleep(900) 
                 
         except Exception as e:
             logger.error(f"Loop error: {e}")
-            time.sleep(60)
+            time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_main_loop, daemon=True).start()
