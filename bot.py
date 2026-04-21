@@ -4,7 +4,6 @@ import logging
 import threading
 import random
 import json
-import re
 import requests
 from datetime import datetime, timezone
 from flask import Flask
@@ -27,10 +26,9 @@ logger = logging.getLogger("polybot")
 
 posted_history = []
 
-class SmartSignalEngine:
+class FinalSignalEngine:
     def fetch_pool(self):
         try:
-            # We fetch more events to ensure we have a good random variety
             params = {"limit": 100, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
             resp = requests.get(GAMMA_API, params=params, timeout=15)
             return resp.json() if resp.status_code == 200 else []
@@ -50,49 +48,58 @@ class SmartSignalEngine:
         markets = selected_event.get("markets", [])
         if not markets: return None
 
-        # SORT MARKETS BY PRICE (To find the "Favorite" or most likely outcome)
+        # Sort by highest probability to pick the "safest" signal (The Favorite)
         try:
-            def get_market_price(m):
+            def get_top_price(m):
                 p_raw = m.get("outcomePrices", "[0.5, 0.5]")
                 p = json.loads(p_raw) if isinstance(p_raw, str) else p_raw
-                return float(p[0]) if p else 0
-            
-            markets.sort(key=get_market_price, reverse=True)
+                return max(float(p[0]), float(p[1]))
+            markets.sort(key=get_top_price, reverse=True)
         except: pass
 
-        m = markets[0] # Pick the top market (the one with 94%, etc.)
+        m = markets[0]
         
         try:
-            # 1. Parse Prices
             prices_raw = m.get("outcomePrices", [0.5, 0.5])
             prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-            price = float(prices[0])
-
-            # 2. Parse Outcome Name
+            
             outcomes_raw = m.get("outcomes", ["Yes", "No"])
             outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-            raw_position = str(outcomes[0])
 
-            # 3. MULTI-OPTION FIX:
-            # If the outcome is just "Yes", use the specific Market Title (Candidate Name)
-            market_title = m.get("groupItemTitle") or m.get("question", "")
+            # Logic to decide if we recommend YES or NO based on higher probability
+            # Usually signals follow the highest probability (The "Winner")
+            price_yes = float(prices[0])
+            price_no = float(prices[1])
             
-            if raw_position.upper() == "YES":
-                # Clean up the market title (remove question marks if present)
-                final_position = market_title.replace("?", "").strip()
+            if price_yes >= price_no:
+                chosen_side = "YES"
+                chosen_prob = price_yes
+                raw_name = str(outcomes[0])
             else:
-                final_position = raw_position
+                chosen_side = "NO"
+                chosen_prob = price_no
+                raw_name = str(outcomes[0]) # We still keep the candidate name as the ID
+
+            # Name Cleaning
+            market_label = m.get("groupItemTitle") or m.get("question", "")
+            if raw_name.upper() in ["YES", "NO"]:
+                position_display = f"{market_label.replace('?', '').strip()} [{chosen_side}]"
+            else:
+                position_display = f"{raw_name.upper()} [{chosen_side}]"
+
+            # ROI Calculation for the chosen side
+            roi = ((1 / chosen_prob) - 1) * 100 if chosen_prob > 0 else 0
 
             return {
                 "q": event_title,
-                "out": final_position,
-                "prob": price * 100,
-                "roi": ((1/price)-1)*100,
+                "out": position_display,
+                "prob": chosen_prob * 100,
+                "roi": roi,
                 "vol": float(selected_event.get("volume", 0) or 0),
                 "slug": selected_event.get("slug")
             }
         except Exception as e:
-            logger.error(f"Error parsing market: {e}")
+            logger.error(f"Error: {e}")
             return None
 
     def format_post(self, tip):
@@ -101,7 +108,7 @@ class SmartSignalEngine:
         msg += f"📅 <i>{now}</i>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"🎯 <b>MARKET:</b>\n{tip['q']}\n\n"
-        msg += f"✅ <b>POSITION:</b> {tip['out'].upper()}\n"
+        msg += f"✅ <b>POSITION:</b> {tip['out']}\n"
         msg += f"📈 <b>PROBABILITY:</b> {tip['prob']:.1f}%\n"
         msg += f"💰 <b>POTENTIAL ROI:</b> +{tip['roi']:.1f}%\n\n"
         msg += f"📊 <b>STATS:</b> Vol ${tip['vol']:,.0f}\n\n"
@@ -111,45 +118,29 @@ class SmartSignalEngine:
         return msg
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEB SERVER & LOOP
+# EXECUTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 @app.route("/")
-def health(): return "OK", 200
+def health(): return "LIVE", 200
 
 def bot_main_loop():
-    engine = SmartSignalEngine()
+    engine = FinalSignalEngine()
     time.sleep(10)
-
     while True:
         try:
-            logger.info("🎲 Choosing market...")
             pool = engine.fetch_pool()
             tip = engine.get_tip(pool)
-            
             if tip:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": engine.format_post(tip),
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                }
-                resp = requests.post(url, json=payload, timeout=15)
-                
-                if resp.status_code == 200:
-                    logger.info("📱 Post sent.")
+                payload = {"chat_id": TELEGRAM_CHAT_ID, "text": engine.format_post(tip), "parse_mode": "HTML", "disable_web_page_preview": True}
+                if requests.post(url, json=payload).status_code == 200:
                     time.sleep(POST_INTERVAL_HOURS * 3600)
-                else:
-                    time.sleep(300)
-            else:
-                time.sleep(300)
-        except Exception as e:
-            logger.error(f"Loop error: {e}")
-            time.sleep(300)
+                else: time.sleep(300)
+            else: time.sleep(300)
+        except: time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_main_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
